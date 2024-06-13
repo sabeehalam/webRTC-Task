@@ -10,7 +10,7 @@ include(GNUInstallDirs)
 option(USE_GNUTLS "Use GnuTLS instead of OpenSSL" OFF)
 option(USE_MBEDTLS "Use Mbed TLS instead of OpenSSL" OFF)
 option(USE_NICE "Use libnice instead of libjuice" OFF)
-option(PREFER_SYSTEM_LIB "Prefer system libraries over deps folder" OFF)
+option(PREFER_SYSTEM_LIB "Prefer system libraries over deps folder" ON)
 option(USE_SYSTEM_SRTP "Use system libSRTP" ${PREFER_SYSTEM_LIB})
 option(USE_SYSTEM_JUICE "Use system libjuice" ${PREFER_SYSTEM_LIB})
 option(USE_SYSTEM_USRSCTP "Use system libusrsctp" ${PREFER_SYSTEM_LIB})
@@ -239,6 +239,11 @@ else()
 	add_subdirectory(deps/plog EXCLUDE_FROM_ALL)
 endif()
 
+if(USE_SYSTEM_PORTAUDIO)
+	find_package(portaudio CONFIG REQUIRED)
+	#target_link_libraries(datachannel PRIVATE portaudio::portaudio)
+endif()
+
 if(SCTP_DEBUG)
 	add_definitions(-DSCTP_DEBUG)
 endif()
@@ -301,6 +306,10 @@ target_include_directories(datachannel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inclu
 target_include_directories(datachannel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(datachannel PRIVATE Threads::Threads)
 target_link_libraries(datachannel PRIVATE Usrsctp::Usrsctp plog::plog)
+
+if(BUILD_SHARED_LIBS)
+    set_target_properties(datachannel PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+endif()
 
 target_include_directories(datachannel-static PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

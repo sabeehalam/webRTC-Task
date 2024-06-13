@@ -20,6 +20,9 @@ using json = nlohmann::json;
 const string opusSamplesDirectory =
     "C:/Users/sabee/source/repos/libdatachannel-2/libdatachannel/examples/streamer/samples/opus/";
 
+const int roomId = 1234;        // AudioBridge room ID
+const int participantId = 2222; // Unique participant ID
+
 /// Audio stream
 optional<shared_ptr<Stream>> audioStream = nullopt;
 
@@ -53,22 +56,71 @@ shared_ptr<Stream> createStream(const string opusSamples, weak_ptr<WebSocket> ws
 	return stream;
 }
 
-void handleJanusMessage(json message, shared_ptr<WebSocket> janusWs) {
+int64_t handleId = 0; // Store the handle ID after attaching the plugin
+int64_t sessionId = 0; // Store the session ID after attaching the plugin
+
+void handleJanusMessage(json message, shared_ptr<rtc::WebSocket> janusWs) {
 	if (message.contains("janus")) {
 		string janusMessageType = message["janus"];
 
-		if (janusMessageType == "event" &&
-		    message["plugindata"]["plugin"] == "janus.plugin.audiobridge") {
-			// Handle events from the AudioBridge plugin
+		if (janusMessageType == "success" && message.contains("transaction")) {
+			string transaction = message["transaction"];
+			if (transaction == "create-session-1") {
+				sessionId = message["data"]["id"];
+				// Session created, now attach the audiobridge plugin
+				json attachPlugin = {{"janus", "attach"},
+				                     {"transaction", "attach-plugin-1"},
+				                     {"plugin", "janus.plugin.audiobridge"},
+				                     {"session_id", sessionId}};
+				janusWs->send(attachPlugin.dump());
+				cout << "Sent attach plugin request: " << attachPlugin.dump() << endl;
+			} else if (transaction == "attach-plugin-1") {
+				// Plugin attached, save handle_id and join the existing room
+				handleId = message["data"]["id"];
+				json joinRoom = {
+				    {"janus", "message"},
+				    {"transaction", "join-room-1234"},
+				    {"body",
+				     {
+				         {"request", "join"},
+				         {"room", 1234},
+				         {"id", 2222}, // Unique participant ID
+				         {"display", "Participant1"},
+				         {"codec", "opus"},
+				         {"secret", "adminpwd"} // Replace with actual secret
+				     }},
+				    {"session_id", sessionId}, // Replace sessionId with the actual session_id
+				    {"handle_id", handleId}    // Replace handleId with the actual handle_id
+				};
+				janusWs->send(joinRoom.dump());
+				cout << "Sent join room request: " << joinRoom.dump() << endl;
+			}
+		} else if (janusMessageType == "event" &&
+		           message["plugindata"]["plugin"] == "janus.plugin.audiobridge") {
 			auto data = message["plugindata"]["data"];
 			if (data.contains("audiobridge") && data["audiobridge"] == "joined") {
-				// Handle joined event
 				cout << "Joined audio bridge room" << endl;
+			} else if (data.contains("audiobridge") && data["audiobridge"] == "event") {
+				// Handle incoming audio samples
+				if (data.contains("participants")) {
+					for (auto &participant : data["participants"]) {
+						if (participant["id"] != 2222) {
+							cout << "Participant " << participant["id"] << " is in the room"
+							     << endl;
+						}
+					}
+				}
 			}
+		} else if (janusMessageType == "message") {
+			auto data = message["plugindata"]["data"];
+			if (data.contains("result") && data["result"]["event"] == "created") {
+				cout << "AudioBridge room created" << endl;
+			}
+		} else {
+			cout << "Unhandled Janus message: " << message.dump() << endl;
 		}
 	}
 }
-
 void wsOnMessage(json message, shared_ptr<WebSocket> janusWs) {
 	if (message.contains("type") && message["type"] == "audio_sample") {
 		// Relay audio sample to Janus
@@ -77,28 +129,33 @@ void wsOnMessage(json message, shared_ptr<WebSocket> janusWs) {
 		                     {"body",
 		                      {{"request", "audio_sample"},
 		                       {"sample_time", message["sample_time"]},
-		                       {"sample", message["sample"]}}}};
+		                       {"sample", message["sample"]}}},
+		                     {"plugin", "janus.plugin.audiobridge"}};
 		janusWs->send(janusMessage.dump());
+		cout << "Sent audio sample message: " << janusMessage.dump() << endl;
 	} else {
 		// Handle other client messages
+		cout << "Unhandled client message: " << message.dump() << endl;
 	}
 }
 
+
 int main() try {
-	InitLogger(LogLevel::Debug);
+	rtc::InitLogger(rtc::LogLevel::Debug);
 
 	// Janus WebSocket configuration
 	rtc::WebSocket::Configuration janusConfig;
 	janusConfig.protocols = {"janus-protocol"};
 
-	auto janusWs = make_shared<WebSocket>(janusConfig);
+	auto janusWs = make_shared<rtc::WebSocket>(janusConfig);
 
 	janusWs->onOpen([&]() {
 		cout << "Janus WebSocket connected, creating session" << endl;
 
 		// Create a session
-		json createSession = {{"janus", "create"}, {"transaction", "create-session"}};
+		json createSession = {{"janus", "create"}, {"transaction", "create-session-1"}};
 		janusWs->send(createSession.dump());
+		cout << "Sent create session request: " << createSession.dump() << endl;
 	});
 
 	janusWs->onClosed([]() { cout << "Janus WebSocket closed" << endl; });
@@ -106,11 +163,11 @@ int main() try {
 	janusWs->onError(
 	    [](const string &error) { cout << "Janus WebSocket failed: " << error << endl; });
 
-	janusWs->onMessage([&](variant<binary, string> data) {
-		if (!holds_alternative<string>(data))
+	janusWs->onMessage([&](variant<rtc::binary, rtc::string> data) {
+		if (!holds_alternative<rtc::string>(data))
 			return;
 
-		json message = json::parse(get<string>(data));
+		json message = json::parse(get<rtc::string>(data));
 		handleJanusMessage(message, janusWs);
 	});
 
@@ -125,16 +182,10 @@ int main() try {
 		this_thread::sleep_for(100ms);
 	}
 
-	// Create the audio stream after WebSocket connection is open
-	audioStream = createStream(opusSamplesDirectory, weak_ptr<WebSocket>(janusWs));
-
+	// Wait for the user to end the program
 	cout << "Connected. Enter any key to exit..." << endl;
 	string input;
 	cin >> input;
-
-	if (audioStream.has_value()) {
-		audioStream.value()->stop();
-	}
 
 	cout << "Exiting..." << endl;
 	return 0;

@@ -1,6 +1,8 @@
 #include "helpers.hpp"
 #include "nlohmann/json.hpp"
 #include "opusfileparser.hpp"
+#include "portaudio.h"
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <memory>
@@ -9,6 +11,7 @@
 #include <thread>
 #include <unordered_map>
 #include <variant>
+#include <vector>
 
 using namespace rtc;
 using namespace std;
@@ -16,17 +19,82 @@ using namespace std::chrono_literals;
 
 using json = nlohmann::json;
 
-/// Directory for Opus samples
-const string opusSamplesDirectory =
-    "C:/Users/sabee/source/repos/libdatachannel-2/libdatachannel/examples/streamer/samples/opus/";
+const int SAMPLE_RATE = 48000;
+const int FRAMES_PER_BUFFER = 960;
 
-/// Audio stream
+bool initializePortAudio() {
+	PaError err = Pa_Initialize();
+	if (err != paNoError) {
+		std::cerr << "PortAudio error: " << Pa_GetErrorText(err) << std::endl;
+		return false;
+	}
+	return true;
+}
+
+void terminatePortAudio() { Pa_Terminate(); }
+
+std::vector<uint8_t> captureAudioSample() {
+	static PaStream *stream;
+	static bool isInitialized = false;
+
+	if (!isInitialized) {
+		initializePortAudio();
+
+		Pa_OpenDefaultStream(&stream,
+		                     1,       // number of input channels
+		                     0,       // number of output channels
+		                     paInt16, // sample format
+		                     SAMPLE_RATE, FRAMES_PER_BUFFER,
+		                     nullptr,  // no callback, use blocking API
+		                     nullptr); // no callback, so no user data
+
+		Pa_StartStream(stream);
+		isInitialized = true;
+	}
+
+	std::vector<int16_t> buffer(FRAMES_PER_BUFFER);
+	Pa_ReadStream(stream, buffer.data(), FRAMES_PER_BUFFER);
+
+	// Convert int16_t buffer to uint8_t
+	std::vector<uint8_t> audioSample(buffer.size() * sizeof(int16_t));
+	std::memcpy(audioSample.data(), buffer.data(), audioSample.size());
+
+	return audioSample;
+}
+
+void playAudioSample(const std::vector<uint8_t> &sample) {
+	static PaStream *stream;
+	static bool isInitialized = false;
+
+	if (!isInitialized) {
+		initializePortAudio();
+
+		Pa_OpenDefaultStream(&stream,
+		                     0,       // number of input channels
+		                     1,       // number of output channels
+		                     paInt16, // sample format
+		                     SAMPLE_RATE, FRAMES_PER_BUFFER,
+		                     nullptr,  // no callback, use blocking API
+		                     nullptr); // no callback, so no user data
+
+		Pa_StartStream(stream);
+		isInitialized = true;
+	}
+
+	// Convert uint8_t sample to int16_t
+	std::vector<int16_t> buffer(sample.size() / sizeof(int16_t));
+	std::memcpy(buffer.data(), sample.data(), sample.size());
+
+	Pa_WriteStream(stream, buffer.data(), FRAMES_PER_BUFFER);
+}
+
+const int roomId = 1234;        // AudioBridge room ID
+const int participantId = 2222; // Unique participant ID
+
 optional<shared_ptr<Stream>> audioStream = nullopt;
 
-/// Incoming message handler for websocket
-void wsOnMessage(json message, shared_ptr<WebSocket> clientWs, shared_ptr<WebSocket> janusWs);
+void wsOnMessage(json message, shared_ptr<WebSocket> janusWs);
 
-/// Create stream
 shared_ptr<Stream> createStream(const string opusSamples, weak_ptr<WebSocket> wsWeak) {
 	// audio source
 	auto audio = make_shared<OPUSFileParser>(opusSamples, true);
@@ -53,24 +121,73 @@ shared_ptr<Stream> createStream(const string opusSamples, weak_ptr<WebSocket> ws
 	return stream;
 }
 
-void handleJanusMessage(json message, shared_ptr<WebSocket> janusWs,
-                        shared_ptr<WebSocket> clientWs) {
+int64_t handleId = 0;  // Store the handle ID after attaching the plugin
+int64_t sessionId = 0; // Store the session ID after attaching the plugin
+
+void handleJanusMessage(json message, shared_ptr<rtc::WebSocket> janusWs) {
 	if (message.contains("janus")) {
 		string janusMessageType = message["janus"];
 
-		if (janusMessageType == "event" &&
-		    message["plugindata"]["plugin"] == "janus.plugin.audiobridge") {
-			// Handle events from the AudioBridge plugin
+		if (janusMessageType == "success" && message.contains("transaction")) {
+			string transaction = message["transaction"];
+			if (transaction == "create-session-1") {
+				sessionId = message["data"]["id"];
+				// Session created, now attach the audiobridge plugin
+				json attachPlugin = {{"janus", "attach"},
+				                     {"transaction", "attach-plugin-1"},
+				                     {"plugin", "janus.plugin.audiobridge"},
+				                     {"session_id", sessionId}};
+				janusWs->send(attachPlugin.dump());
+				cout << "Sent attach plugin request: " << attachPlugin.dump() << endl;
+			} else if (transaction == "attach-plugin-1") {
+				// Plugin attached, save handle_id and join the existing room
+				handleId = message["data"]["id"];
+				json joinRoom = {
+				    {"janus", "message"},
+				    {"transaction", "join-room-1234"},
+				    {"body",
+				     {
+				         {"request", "join"},
+				         {"room", 1234},
+				         {"id", 2222}, // Unique participant ID
+				         {"display", "Participant1"},
+				         {"codec", "opus"},
+				         {"secret", "adminpwd"} // Replace with actual secret
+				     }},
+				    {"session_id", sessionId}, // Replace sessionId with the actual session_id
+				    {"handle_id", handleId}    // Replace handleId with the actual handle_id
+				};
+				janusWs->send(joinRoom.dump());
+				cout << "Sent join room request: " << joinRoom.dump() << endl;
+			}
+		} else if (janusMessageType == "event" &&
+		           message["plugindata"]["plugin"] == "janus.plugin.audiobridge") {
 			auto data = message["plugindata"]["data"];
 			if (data.contains("audiobridge") && data["audiobridge"] == "joined") {
-				// Handle joined event
 				cout << "Joined audio bridge room" << endl;
+			} else if (data.contains("audiobridge") && data["audiobridge"] == "event") {
+				// Handle incoming audio samples
+				if (data.contains("participants")) {
+					for (auto &participant : data["participants"]) {
+						if (participant["id"] != 2222) {
+							cout << "Participant " << participant["id"] << " is in the room"
+							     << endl;
+						}
+					}
+				}
 			}
+		} else if (janusMessageType == "message") {
+			auto data = message["plugindata"]["data"];
+			if (data.contains("result") && data["result"]["event"] == "created") {
+				cout << "AudioBridge room created" << endl;
+			}
+		} else {
+			cout << "Unhandled Janus message: " << message.dump() << endl;
 		}
 	}
 }
 
-void wsOnMessage(json message, shared_ptr<WebSocket> clientWs, shared_ptr<WebSocket> janusWs) {
+void wsOnMessage(json message, shared_ptr<WebSocket> janusWs) {
 	if (message.contains("type") && message["type"] == "audio_sample") {
 		// Relay audio sample to Janus
 		json janusMessage = {{"janus", "message"},
@@ -78,58 +195,37 @@ void wsOnMessage(json message, shared_ptr<WebSocket> clientWs, shared_ptr<WebSoc
 		                     {"body",
 		                      {{"request", "audio_sample"},
 		                       {"sample_time", message["sample_time"]},
-		                       {"sample", message["sample"]}}}};
+		                       {"sample", message["sample"]}}},
+		                     {"plugin", "janus.plugin.audiobridge"}};
 		janusWs->send(janusMessage.dump());
+		cout << "Sent audio sample message: " << janusMessage.dump() << endl;
 	} else {
 		// Handle other client messages
+		cout << "Unhandled client message: " << message.dump() << endl;
 	}
 }
 
 int main() try {
-	InitLogger(LogLevel::Debug);
+	rtc::InitLogger(rtc::LogLevel::Debug);
 
-	string localId = "client-2";
-	cout << "The local ID is: " << localId << endl;
+	// Initialize PortAudio
+	if (!initializePortAudio()) {
+		return -1;
+	}
 
-	// WebSocket configuration
-	rtc::WebSocket::Configuration clientConfig;
-	clientConfig.protocols = {"janus-protocol"};
-
-	// Client WebSocket
-	auto clientWs = make_shared<WebSocket>(clientConfig);
-
-	clientWs->onOpen([]() { cout << "Client WebSocket connected, signaling ready" << endl; });
-
-	clientWs->onClosed([]() { cout << "Client WebSocket closed" << endl; });
-
-	clientWs->onError(
-	    [](const string &error) { cout << "Client WebSocket failed: " << error << endl; });
-
-	clientWs->onMessage([&](variant<binary, string> data) {
-		if (!holds_alternative<string>(data))
-			return;
-
-		json message = json::parse(get<string>(data));
-		// Handle client messages
-		wsOnMessage(message, clientWs, nullptr); // Janus WebSocket not yet connected
-	});
-
-	const string clientUrl = "ws://127.0.0.1:8188/" + localId;
-	cout << "Client URL is " << clientUrl << endl;
-	clientWs->open(clientUrl);
-
-	// Janus WebSocket
+	// Janus WebSocket configuration
 	rtc::WebSocket::Configuration janusConfig;
-	janusConfig.protocols = {"janus-protocol"}; // Set the required sub-protocol
+	janusConfig.protocols = {"janus-protocol"};
 
-	auto janusWs = make_shared<WebSocket>(janusConfig);
+	auto janusWs = make_shared<rtc::WebSocket>(janusConfig);
 
 	janusWs->onOpen([&]() {
 		cout << "Janus WebSocket connected, creating session" << endl;
 
 		// Create a session
-		json createSession = {{"janus", "create"}, {"transaction", "create-session"}};
+		json createSession = {{"janus", "create"}, {"transaction", "create-session-1"}};
 		janusWs->send(createSession.dump());
+		cout << "Sent create session request: " << createSession.dump() << endl;
 	});
 
 	janusWs->onClosed([]() { cout << "Janus WebSocket closed" << endl; });
@@ -137,12 +233,12 @@ int main() try {
 	janusWs->onError(
 	    [](const string &error) { cout << "Janus WebSocket failed: " << error << endl; });
 
-	janusWs->onMessage([&](variant<binary, string> data) {
-		if (!holds_alternative<string>(data))
+    janusWs->onMessage([&](variant<rtc::binary, rtc::string> data) {
+		if (!holds_alternative<rtc::string>(data))
 			return;
 
-		json message = json::parse(get<string>(data));
-		handleJanusMessage(message, janusWs, clientWs);
+	    json message = json::parse(get<rtc::string>(data));
+		handleJanusMessage(message, janusWs);
 	});
 
 	const string janusUrl = "ws://127.0.0.1:8188/janus";
@@ -150,23 +246,20 @@ int main() try {
 	janusWs->open(janusUrl);
 
 	cout << "Waiting for signaling to be connected..." << endl;
-	while (!clientWs->isOpen() || !janusWs->isOpen()) {
-		if (clientWs->isClosed() || janusWs->isClosed())
+	while (!janusWs->isOpen()) {
+		if (janusWs->isClosed())
 			return 1;
 		this_thread::sleep_for(100ms);
 	}
 
-	// Create the audio stream after WebSocket connections are open
-	audioStream = createStream(opusSamplesDirectory, weak_ptr<WebSocket>(clientWs));
-
+	// Wait for the user to end the program
 	cout << "Connected. Enter any key to exit..." << endl;
 	string input;
 	cin >> input;
 
-	if (audioStream.has_value()) {
-		audioStream.value()->stop();
-	}
-
+	// Cleanup
+	janusWs->close();
+	terminatePortAudio();
 	cout << "Exiting..." << endl;
 	return 0;
 
