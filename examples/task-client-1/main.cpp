@@ -1,6 +1,8 @@
 #include "helpers.hpp"
 #include "nlohmann/json.hpp"
 #include "opusfileparser.hpp"
+#include "portaudio.h"
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <memory>
@@ -9,6 +11,7 @@
 #include <thread>
 #include <unordered_map>
 #include <variant>
+#include <vector>
 
 using namespace rtc;
 using namespace std;
@@ -16,20 +19,82 @@ using namespace std::chrono_literals;
 
 using json = nlohmann::json;
 
-/// Directory for Opus samples
-const string opusSamplesDirectory =
-    "C:/Users/sabee/source/repos/libdatachannel-2/libdatachannel/examples/streamer/samples/opus/";
+const int SAMPLE_RATE = 48000;
+const int FRAMES_PER_BUFFER = 960;
+
+bool initializePortAudio() {
+	PaError err = Pa_Initialize();
+	if (err != paNoError) {
+		std::cerr << "PortAudio error: " << Pa_GetErrorText(err) << std::endl;
+		return false;
+	}
+	return true;
+}
+
+void terminatePortAudio() { Pa_Terminate(); }
+
+std::vector<uint8_t> captureAudioSample() {
+	static PaStream *stream;
+	static bool isInitialized = false;
+
+	if (!isInitialized) {
+		initializePortAudio();
+
+		Pa_OpenDefaultStream(&stream,
+		                     1,       // number of input channels
+		                     0,       // number of output channels
+		                     paInt16, // sample format
+		                     SAMPLE_RATE, FRAMES_PER_BUFFER,
+		                     nullptr,  // no callback, use blocking API
+		                     nullptr); // no callback, so no user data
+
+		Pa_StartStream(stream);
+		isInitialized = true;
+	}
+
+	std::vector<int16_t> buffer(FRAMES_PER_BUFFER);
+	Pa_ReadStream(stream, buffer.data(), FRAMES_PER_BUFFER);
+
+	// Convert int16_t buffer to uint8_t
+	std::vector<uint8_t> audioSample(buffer.size() * sizeof(int16_t));
+	std::memcpy(audioSample.data(), buffer.data(), audioSample.size());
+
+	return audioSample;
+}
+
+void playAudioSample(const std::vector<uint8_t> &sample) {
+	static PaStream *stream;
+	static bool isInitialized = false;
+
+	if (!isInitialized) {
+		initializePortAudio();
+
+		Pa_OpenDefaultStream(&stream,
+		                     0,       // number of input channels
+		                     1,       // number of output channels
+		                     paInt16, // sample format
+		                     SAMPLE_RATE, FRAMES_PER_BUFFER,
+		                     nullptr,  // no callback, use blocking API
+		                     nullptr); // no callback, so no user data
+
+		Pa_StartStream(stream);
+		isInitialized = true;
+	}
+
+	// Convert uint8_t sample to int16_t
+	std::vector<int16_t> buffer(sample.size() / sizeof(int16_t));
+	std::memcpy(buffer.data(), sample.data(), sample.size());
+
+	Pa_WriteStream(stream, buffer.data(), FRAMES_PER_BUFFER);
+}
 
 const int roomId = 1234;        // AudioBridge room ID
 const int participantId = 2222; // Unique participant ID
 
-/// Audio stream
 optional<shared_ptr<Stream>> audioStream = nullopt;
 
-/// Incoming message handler for websocket
 void wsOnMessage(json message, shared_ptr<WebSocket> janusWs);
 
-/// Create stream
 shared_ptr<Stream> createStream(const string opusSamples, weak_ptr<WebSocket> wsWeak) {
 	// audio source
 	auto audio = make_shared<OPUSFileParser>(opusSamples, true);
@@ -56,7 +121,7 @@ shared_ptr<Stream> createStream(const string opusSamples, weak_ptr<WebSocket> ws
 	return stream;
 }
 
-int64_t handleId = 0; // Store the handle ID after attaching the plugin
+int64_t handleId = 0;  // Store the handle ID after attaching the plugin
 int64_t sessionId = 0; // Store the session ID after attaching the plugin
 
 void handleJanusMessage(json message, shared_ptr<rtc::WebSocket> janusWs) {
@@ -121,6 +186,7 @@ void handleJanusMessage(json message, shared_ptr<rtc::WebSocket> janusWs) {
 		}
 	}
 }
+
 void wsOnMessage(json message, shared_ptr<WebSocket> janusWs) {
 	if (message.contains("type") && message["type"] == "audio_sample") {
 		// Relay audio sample to Janus
@@ -139,9 +205,13 @@ void wsOnMessage(json message, shared_ptr<WebSocket> janusWs) {
 	}
 }
 
-
 int main() try {
 	rtc::InitLogger(rtc::LogLevel::Debug);
+
+	// Initialize PortAudio
+	if (!initializePortAudio()) {
+		return -1;
+	}
 
 	// Janus WebSocket configuration
 	rtc::WebSocket::Configuration janusConfig;
@@ -187,6 +257,9 @@ int main() try {
 	string input;
 	cin >> input;
 
+	// Cleanup
+	janusWs->close();
+	terminatePortAudio();
 	cout << "Exiting..." << endl;
 	return 0;
 

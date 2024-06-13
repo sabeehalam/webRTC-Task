@@ -45,7 +45,8 @@ set_target_properties(task-client-2 PROPERTIES
 	XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER com.github.paullouisageneau.libdatachannel.examples.streamer)
 
 find_package(Threads REQUIRED)
-target_link_libraries(task-client-2 LibDataChannel::LibDataChannel Threads::Threads nlohmann_json::nlohmann_json)
+find_package(portaudio CONFIG REQUIRED)
+target_link_libraries(task-client-2 LibDataChannel::LibDataChannel Threads::Threads nlohmann_json::nlohmann_json portaudio)
 
 if(MSVC)
 	add_custom_command(TARGET task-client-2 POST_BUILD
